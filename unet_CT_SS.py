@@ -1,125 +1,89 @@
-#!/usr/bin/env python2
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Nov  9 13:18:46 2017
-
-@author: m131199
-"""
-
 import os
-import sys
-import time
-arg0 = sys.argv[0]
-print(arg0)
+import numpy as np
+import nibabel as nb
+import tensorflow as tf
+import argparse
+from tqdm import tqdm
+from deepModels import Unet
 
 
-code_dir=os.getcwd()
-hour = str(time.localtime()[3])
-mins = str(time.localtime()[4])
-sec = str(time.localtime()[5])
-timeStamp = str(time.localtime()[0])+str(time.localtime()[1])+str(time.localtime()[2])+'_'+hour+mins+sec
-               
-sys.path.append(code_dir)
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+def load_model(weights_path, image_shape, nb_classes=2):
+    model = Unet(image_shape=image_shape, nb_classes=nb_classes)
+    model.load_weights(weights_path)
+    return model
 
-from auggen import AugmentationGenerator as dataGenerator
-from model_CT_SS import Unet_CT_SS as genUnet
+def check_gpu():
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            tf.config.experimental.set_visible_devices(gpus[0], 'GPU')
+            logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+            print(f"{len(gpus)} Physical GPUs, {len(logical_gpus)} Logical GPUs")
+        except RuntimeError as e:
+            print(e)
+    else:
+        print("No GPU available, using CPU")
 
+def load_test_data(images_path, each):
+    img = nb.load(os.path.join(images_path, each))
+    images = img.get_fdata()
+    affine = img.affine
+    if len(images.shape) == 2:
+        images = images.reshape(images.shape[0], images.shape[1], 1)
+    if len(images.shape) != 3:
+        return None, None
 
-#===============output label & mode flags======================#
-#*************set these flags before running*******************#
-oLabel = arg0[arg0.rfind('/')+1:-3]+'_'+timeStamp 
-resultsFolder='results_folder'
-pred_folder= 'predictions'
-train=False
-predict=True # run predictions for a specific weights.
-#========================================================#
-#create folders to save outputs
+    img_rows, img_cols, num_imgs = images.shape
+    images = images.transpose(2, 0, 1).reshape(num_imgs, img_rows, img_cols, 1).astype(np.float32)
+    return images, affine
 
-if  not os.path.lexists(os.path.join(code_dir,resultsFolder,oLabel)):
-    os.mkdir(os.path.join(code_dir,resultsFolder,oLabel))
-if  not os.path.lexists(os.path.join(code_dir,resultsFolder,oLabel,pred_folder)):
-    os.mkdir(os.path.join(code_dir,resultsFolder,oLabel,pred_folder))
-   
-                      
-#======================log file==========================#
-logFile = open(os.path.join(code_dir,'results_folder',oLabel,'log_'+oLabel+'.txt'),'w') 
-#========================================================#
+def save_nifti_image(data, affine, save_path):
+    nifti_img = nb.Nifti1Image(data, affine)
+    nb.save(nifti_img, save_path)
 
-dataAugmentation=False  
-if dataAugmentation:         
-    datagen = dataGenerator(rotation_z = 30,
-            rotation_x = 0,
-            rotation_y = 0,
-            translation_xy = 5,
-            translation_z = 0,
-            scale_xy = 0.1,
-            scale_z = 0,
-            flip_h = True,
-            flip_v = False)
-    datagenPrams=datagen.__str__()
-    afold=3
-else:
-    datagen=''
-    datagenPrams=''
-    afold=''
-#===================set optimizer=====================#
-lr=1e-5
-decay=1e-6
-optimizer = 'adam'
-#optimizer = SGD(lr=1e-4, momentum=0.9, decay=1e-9, nesterov=True)
-#========================================================#
+def process_one_image(model, each, img_dir, save_path):
+    try:
+        print(f'Processing case: {each}')
+        test_images, affine = load_test_data(img_dir, each)
+        if test_images is None or test_images.shape[1] != 512 or test_images.shape[2] != 512:
+            print(f"Skipping {each} due to shape mismatch: {test_images.shape if test_images is not None else 'None'}")
+            return
 
-unetSS = genUnet(root_folder=code_dir, 
-    image_folder = 'image_data',
-    mask_folder = 'mask_data',
-    save_folder= os.path.join(code_dir,resultsFolder,oLabel), 
-    pred_folder=pred_folder,
-    savePredMask=True,
-    testLabelFlag=False,
-    testMetricFlag=False, 
-    dataAugmentation = dataAugmentation,
-    logFileName='log_'+oLabel+'.txt',
-    datagen=datagen,
-    oLabel=oLabel,
-    checkWeightFileName=oLabel+'.h5',
-    afold=afold, 
-    numEpochs=100,
-    bs = 1, 
-    nb_classes=2,
-    sC=2, #saved class
-    img_row=512,img_col=512,channel=1,
-    classifier = 'softmax',
-    optimizer =optimizer,
-    lr=lr,
-    decay=decay,
-    dtype='float32',dtypeL='uint8',
-    wType='slice',
-    loss='categorical_crossentropy',
-    metric='accuracy',
-    model='unet')
+        pred_image = model.predict(test_images, batch_size=8, verbose=1)
+        pred_image = tf.argmax(pred_image, axis=-1).numpy().astype(np.uint8)
+        pred_image = pred_image.reshape(test_images.shape[0], test_images.shape[1], test_images.shape[2])
 
+        save_nifti_image(pred_image.transpose(1, 2, 0), affine, save_path)
+        print(f'Processed {each} successfully.')
+    except Exception as e:
+        print(f"Skipping file {each}, error: {e}")
 
-logFile.write('\n'+'-'*30+'\n')
-logFile.write(unetSS.__str__()) 
-logFile.write('\n'+'-'*30+'\n')
-logFile.write(datagenPrams)
-logFile.write('\n'+'-'*30+'\n')
-logFile.close()
+def main(img_dir, res_dir, weights_path, series=False):
+    check_gpu()
+    model = load_model(weights_path, image_shape=(512, 512, 1))
+
+    if series:
+        for series_dir in tqdm(os.listdir(img_dir)):
+            os.makedirs(os.path.join(res_dir, series_dir))
+            for each in os.listdir(os.path.join(img_dir, series_dir)): 
+                save_path = os.path.join(res_dir, series_dir, each)
+                load_img_dir = os.path.join(img_dir, series_dir)
+                process_one_image(model, each, load_img_dir, save_path)
+    
+    else:
+        files = [each for each in sorted(os.listdir(img_dir)) if each.endswith(".nii.gz")]
+        for each in files:
+            if each is None:
+                continue
+            save_path = os.path.join(res_dir, each)
+            process_one_image(model, each, img_dir, save_path)
 
 
 if __name__ == '__main__':
-    if predict:
-        unetSS.pred_folder=pred_folder
-        unetSS.save_folder = os.path.join(code_dir,resultsFolder,oLabel,pred_folder)
-        unetSS.weight_folder=os.path.join(code_dir,'weights_folder')
-        weightFile=(os.path.join(unetSS.weight_folder,'unet_CT_SS_20171114_170726.h5'))
-        unetSS.Predict(weightFile)
-        #to run unet3D model, use Predict3D
-        #unetSS.Predict3D(weightFile)
-    elif train:
-        unetSS.train()
-        #to run 3D unet model, use the train3D
-        #unetSS.train3D()
-    else:
-        print('please set a task flag: train or predict')
+    parser = argparse.ArgumentParser(description="Brain Extraction Tool Prediction")
+    parser.add_argument("--res_dir", type=str, required=True, help="Path to the directory that will contain resulting mask files")
+    parser.add_argument("--img_dir", type=str, required=True, help="Path to the directory containing NIfTI images to do BET on")
+    parser.add_argument("--weights_path", type=str, required=True, help="Path to the weights file for the model")
+    args = parser.parse_args()
+
+    main(args.img_dir, args.res_dir, args.weights_path)
